@@ -1,0 +1,17 @@
+# DOCX 模块
+python-docx
+mammoth
+lxml
+pandas
+Pillow
+loguru
+pydantic
+pylatexenc
+beautifulsoup4
+
+# PDF/Image 模块
+pypdfium2
+mineru_vl_utils
+
+# Pipeline 新增
+requests>=2.28.0
