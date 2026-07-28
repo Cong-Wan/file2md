@@ -1,5 +1,9 @@
 '''
 Author: wilbur
+Version: 3.6
+  Date: 2026-07-28
+  Description: 修复 parse+translate 断点续跑时未重试缓存中 pending/failed 翻译页的问题
+
 Version: 3.5
   Date: 2026-07-28
   Description: 修正 --max-concurrent-translate 的 help 文案：默认值实为 5，原文案误写为 2
@@ -565,6 +569,16 @@ def _runParsePipelineTask(ctx: PdfPipelineContext, apiKey: str) -> None:
     translateFutures = []
 
     try:
+        if translator and translateExecutor:
+            cachedPending = [
+                page for page in ctx.cache.iterPendingTranslations()
+                if page["pageNum"] < breakpoint
+            ]
+            for page in cachedPending:
+                translateFutures.append(_submitTranslationFuture(ctx, translator, translateExecutor, page))
+            if cachedPending:
+                log(f"已从缓存恢复 {len(cachedPending)} 个待翻译页面", "INFO", ctx.verbose)
+
         for pageNum, img in pageImages:
             if pageNum < breakpoint:
                 continue
