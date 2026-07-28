@@ -1,5 +1,9 @@
 '''
 Author: wilbur
+Version: 1.7
+  Date: 2026-07-28
+  Description: 迁移至 core 包，日志改为 core.logUtils 统一实现并补 [Translator] tag
+
 Version: 1.6
   Date: 2026-05-21
   Description: verbose 打印翻译原始响应 JSON 和 content
@@ -26,6 +30,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import requests.adapters
 
+from core.logUtils import log as _log
+
 
 TRANSLATION_SYSTEM_PROMPT = (
     "你是一个专业的学术论文翻译专家。请将以下Markdown内容翻译成中文。\n\n"
@@ -39,20 +45,6 @@ TRANSLATION_SYSTEM_PROMPT = (
 )
 
 
-def _log(msg: str, level: str = "INFO", verbose: bool = True):
-    if not verbose and level == "DEBUG":
-        return
-    from datetime import datetime
-    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    prefix = {
-        "INFO":  "\033[32m[INFO ]\033[0m",
-        "DEBUG": "\033[36m[DEBUG]\033[0m",
-        "WARN":  "\033[33m[WARN ]\033[0m",
-        "ERROR": "\033[31m[ERROR]\033[0m",
-    }.get(level, "[????]")
-    print(f"{timestamp} {prefix} [Translator] {msg}", flush=True)
-
-
 def _logRawJson(title: str, data: dict, verbose: bool) -> None:
     if not verbose:
         return
@@ -60,7 +52,7 @@ def _logRawJson(title: str, data: dict, verbose: bool) -> None:
         raw = json.dumps(data, ensure_ascii=False, default=str, indent=2)
     except Exception:
         raw = str(data)
-    _log(f"{title}:\n{raw}", "DEBUG", True)
+    _log(f"{title}:\n{raw}", "DEBUG", True, tag="[Translator]")
 
 
 THINKING_HEAD_KEYWORDS = (
@@ -140,12 +132,12 @@ def _stripThinkingProcess(text: str) -> str:
                 cleaned = cleaned[lastEnd:]
                 _log(
                     "思考过程剥离走退化路径（未匹配到闭标签+分隔符组合）",
-                    "WARN", True,
+                    "WARN", True, tag="[Translator]",
                 )
             else:
                 _log(
                     "响应开头疑似思考但未找到闭标签，原样返回",
-                    "WARN", True,
+                    "WARN", True, tag="[Translator]",
                 )
 
     # Step 3: 收尾清理
@@ -187,7 +179,7 @@ class Translator:
         self.verbose = verbose
         self.apiType = _detectApiType(apiUrl)
         self._threadLocal = threading.local()
-        _log(f"翻译 API 类型: {self.apiType} (URL: {apiUrl})", "INFO", verbose)
+        _log(f"翻译 API 类型: {self.apiType} (URL: {apiUrl})", "INFO", verbose, tag="[Translator]")
 
     def _getSession(self) -> requests.Session:
         """获取当前线程专属的 requests.Session，惰性创建。"""
@@ -274,7 +266,7 @@ class Translator:
 
         for attempt in range(self.maxRetry):
             try:
-                _log(f"翻译请求 (尝试 {attempt + 1}/{self.maxRetry})", "DEBUG", self.verbose)
+                _log(f"翻译请求 (尝试 {attempt + 1}/{self.maxRetry})", "DEBUG", self.verbose, tag="[Translator]")
                 response = session.post(
                     self.apiUrl,
                     json=payload,
@@ -286,10 +278,10 @@ class Translator:
 
                 content = self._extractContent(data)
                 if self.verbose:
-                    _log(f"翻译响应原始 content:\n{content}", "DEBUG", True)
+                    _log(f"翻译响应原始 content:\n{content}", "DEBUG", True, tag="[Translator]")
 
                 result = _stripThinkingTags(content)
-                _log(f"翻译响应成功，内容长度: {len(result)}", "DEBUG", self.verbose)
+                _log(f"翻译响应成功，内容长度: {len(result)}", "DEBUG", self.verbose, tag="[Translator]")
                 return result
 
             except requests.exceptions.RequestException as e:
@@ -301,16 +293,16 @@ class Translator:
                         detail = "(无法读取响应体)"
                 _log(
                     f"翻译请求失败 (尝试 {attempt + 1}/{self.maxRetry}): {e}，详情: {detail}，"
-                    f"{self.retryDelay}s 后重试", "WARN", True,
+                    f"{self.retryDelay}s 后重试", "WARN", True, tag="[Translator]",
                 )
                 if attempt < self.maxRetry - 1:
                     time.sleep(self.retryDelay)
             except (KeyError, IndexError, json.JSONDecodeError) as e:
-                _log(f"翻译响应解析失败: {e}，{self.retryDelay}s 后重试", "WARN", True)
+                _log(f"翻译响应解析失败: {e}，{self.retryDelay}s 后重试", "WARN", True, tag="[Translator]")
                 if attempt < self.maxRetry - 1:
                     time.sleep(self.retryDelay)
 
-        _log(f"翻译 API 调用全部失败（{self.maxRetry} 次重试用尽）", "ERROR", True)
+        _log(f"翻译 API 调用全部失败（{self.maxRetry} 次重试用尽）", "ERROR", True, tag="[Translator]")
         return None
 
     def translate(self, text: str) -> str | None:
@@ -324,7 +316,7 @@ class Translator:
         """
         if not text or not text.strip():
             return text
-        _log(f"翻译文本 (长度: {len(text)})", "INFO", self.verbose)
+        _log(f"翻译文本 (长度: {len(text)})", "INFO", self.verbose, tag="[Translator]")
         return self._callApi(text)
 
     def translateTexts(self, texts: list[str]) -> list[str | None]:
@@ -339,7 +331,7 @@ class Translator:
         if not texts:
             return []
 
-        _log(f"开始并发翻译 {len(texts)} 段文本（并发数: {self.maxConcurrent}）", "INFO", self.verbose)
+        _log(f"开始并发翻译 {len(texts)} 段文本（并发数: {self.maxConcurrent}）", "INFO", self.verbose, tag="[Translator]")
 
         results: list[str | None] = [None] * len(texts)
 
@@ -353,9 +345,9 @@ class Translator:
                 try:
                     results[idx] = future.result()
                 except Exception as e:
-                    _log(f"翻译异常 (index={idx}): {e}", "ERROR", True)
+                    _log(f"翻译异常 (index={idx}): {e}", "ERROR", True, tag="[Translator]")
                     results[idx] = None
 
         successCount = sum(1 for r in results if r is not None)
-        _log(f"翻译完成: {successCount}/{len(texts)} 成功", "INFO", self.verbose)
+        _log(f"翻译完成: {successCount}/{len(texts)} 成功", "INFO", self.verbose, tag="[Translator]")
         return results

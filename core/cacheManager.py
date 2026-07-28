@@ -1,5 +1,9 @@
 '''
 Author: wilbur
+Version: 1.4
+  Date: 2026-07-28
+  Description: 迁移至 core 包，日志改为 core.logUtils 统一实现并补 [CacheManager] tag
+
 Version: 1.3
   Date: 2026-05-21
   Description: 升级缓存为 v3.0，拆分解析、图片理解、翻译状态并支持任务模式恢复
@@ -28,18 +32,7 @@ import threading
 from pathlib import Path
 from datetime import datetime
 
-
-def _log(msg: str, level: str = "INFO", verbose: bool = True):
-    if not verbose and level == "DEBUG":
-        return
-    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    prefix = {
-        "INFO":  "\033[32m[INFO ]\033[0m",
-        "DEBUG": "\033[36m[DEBUG]\033[0m",
-        "WARN":  "\033[33m[WARN ]\033[0m",
-        "ERROR": "\033[31m[ERROR]\033[0m",
-    }.get(level, "[????]")
-    print(f"{timestamp} {prefix} [CacheManager] {msg}", flush=True)
+from core.logUtils import log as _log
 
 
 class CacheManager:
@@ -114,7 +107,7 @@ class CacheManager:
                 assert "inputHash" in data
                 currentHash = self._computeFileHash()
                 if data["inputHash"] != currentHash:
-                    _log("输入文件已变更，清空缓存", "WARN", True)
+                    _log("输入文件已变更，清空缓存", "WARN", True, tag="[CacheManager]")
                     self._data = self._createNew()
                     self.save()
                     return self._data
@@ -123,17 +116,17 @@ class CacheManager:
                 self._data = migrated
                 if migrated != data:
                     self.save()
-                _log(f"加载已有缓存: {len(self.getCompletedPages())} 页已完成", "INFO", self.verbose)
+                _log(f"加载已有缓存: {len(self.getCompletedPages())} 页已完成", "INFO", self.verbose, tag="[CacheManager]")
                 return self._data
             except (json.JSONDecodeError, AssertionError, KeyError) as e:
-                _log(f"缓存文件损坏({e})，重新创建", "WARN", True)
+                _log(f"缓存文件损坏({e})，重新创建", "WARN", True, tag="[CacheManager]")
                 self._data = self._createNew()
                 self.save()
                 return self._data
         else:
             self._data = self._createNew()
             self.save()
-            _log("创建新缓存", "INFO", self.verbose)
+            _log("创建新缓存", "INFO", self.verbose, tag="[CacheManager]")
             return self._data
 
     def save(self) -> None:
@@ -147,7 +140,7 @@ class CacheManager:
         cacheDir = os.path.dirname(self.cachePath)
         if os.path.isdir(cacheDir):
             shutil.rmtree(cacheDir)
-            _log(f"已删除缓存目录: {cacheDir}", "INFO", self.verbose)
+            _log(f"已删除缓存目录: {cacheDir}", "INFO", self.verbose, tag="[CacheManager]")
 
     # ============================================================
     # 页级操作（PDF/Image）

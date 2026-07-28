@@ -1,5 +1,9 @@
 '''
 Author: wilbur
+Version: 1.4
+  Date: 2026-07-28
+  Description: 迁移至 core 包，日志改为 core.logUtils 统一实现并补 [ImageAnalyzer] tag
+
 Version: 1.3
   Date: 2026-04-23
   Description: 新增 analyzeImageWithCallback() 带回调的单图分析方法
@@ -23,9 +27,10 @@ import time
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-from datetime import datetime
 
 import requests
+
+from core.logUtils import log as _log
 
 
 # ============================================================
@@ -167,23 +172,6 @@ document 输出字段要求：
 """
 
 # ============================================================
-# 日志工具
-# ============================================================
-
-def _log(msg: str, level: str = "INFO", verbose: bool = True):
-    if not verbose and level == "DEBUG":
-        return
-    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    prefix = {
-        "INFO":  "\033[32m[INFO ]\033[0m",
-        "DEBUG": "\033[36m[DEBUG]\033[0m",
-        "WARN":  "\033[33m[WARN ]\033[0m",
-        "ERROR": "\033[31m[ERROR]\033[0m",
-    }.get(level, "[????]")
-    print(f"{timestamp} {prefix} [ImageAnalyzer] {msg}", flush=True)
-
-
-# ============================================================
 # 响应解析
 # ============================================================
 
@@ -248,7 +236,7 @@ def _parseApiResponse(content: str) -> dict:
                 continue
 
     # 降级: 原始文本作为 content
-    _log(f"JSON 解析失败，使用原始文本作为 content", "WARN", True)
+    _log(f"JSON 解析失败，使用原始文本作为 content", "WARN", True, tag="[ImageAnalyzer]")
     return {
         "type": "document",
         "content": content,
@@ -344,7 +332,7 @@ class ImageAnalyzer:
 
         for attempt in range(self.maxRetry):
             try:
-                _log(f"API 请求 (尝试 {attempt + 1}/{self.maxRetry})", "DEBUG", self.verbose)
+                _log(f"API 请求 (尝试 {attempt + 1}/{self.maxRetry})", "DEBUG", self.verbose, tag="[ImageAnalyzer]")
                 response = session.post(
                     self.apiUrl,
                     json=payload,
@@ -361,7 +349,7 @@ class ImageAnalyzer:
                 if not isinstance(content, str):
                     content = str(content) if content else ""
 
-                _log(f"API 响应成功，内容长度: {len(content)}", "DEBUG", self.verbose)
+                _log(f"API 响应成功，内容长度: {len(content)}", "DEBUG", self.verbose, tag="[ImageAnalyzer]")
                 return _parseApiResponse(content)
 
             except requests.exceptions.RequestException as e:
@@ -371,15 +359,15 @@ class ImageAnalyzer:
                         detail = e.response.text[:500]
                     except Exception:
                         detail = "(无法读取响应体)"
-                _log(f"API 请求失败 (尝试 {attempt + 1}/{self.maxRetry}): {e}，详情: {detail}，{self.retryDelay}s 后重试", "WARN", True)
+                _log(f"API 请求失败 (尝试 {attempt + 1}/{self.maxRetry}): {e}，详情: {detail}，{self.retryDelay}s 后重试", "WARN", True, tag="[ImageAnalyzer]")
                 if attempt < self.maxRetry - 1:
                     time.sleep(self.retryDelay)
             except (KeyError, IndexError, json.JSONDecodeError) as e:
-                _log(f"API 响应解析失败: {e}，{self.retryDelay}s 后重试", "WARN", True)
+                _log(f"API 响应解析失败: {e}，{self.retryDelay}s 后重试", "WARN", True, tag="[ImageAnalyzer]")
                 if attempt < self.maxRetry - 1:
                     time.sleep(self.retryDelay)
 
-        _log(f"API 调用全部失败（{self.maxRetry} 次重试用尽）", "ERROR", True)
+        _log(f"API 调用全部失败（{self.maxRetry} 次重试用尽）", "ERROR", True, tag="[ImageAnalyzer]")
         return None
 
     def analyzeImage(self, imageSource: dict) -> dict | None:
@@ -398,19 +386,19 @@ class ImageAnalyzer:
 
         if "path" in imageSource and imageSource["path"]:
             filePath = imageSource["path"]
-            _log(f"分析图片: {filePath}", "INFO", self.verbose)
+            _log(f"分析图片: {filePath}", "INFO", self.verbose, tag="[ImageAnalyzer]")
             try:
                 with open(filePath, "rb") as f:
                     imgData = f.read()
                 base64Data = base64.b64encode(imgData).decode("utf-8")
             except IOError as e:
-                _log(f"读取图片失败: {filePath} - {e}", "ERROR", True)
+                _log(f"读取图片失败: {filePath} - {e}", "ERROR", True, tag="[ImageAnalyzer]")
                 return None
         elif "base64" in imageSource and imageSource["base64"]:
             base64Data = imageSource["base64"]
-            _log(f"分析图片: base64 数据 (长度: {len(base64Data)})", "INFO", self.verbose)
+            _log(f"分析图片: base64 数据 (长度: {len(base64Data)})", "INFO", self.verbose, tag="[ImageAnalyzer]")
         else:
-            _log("imageSource 缺少 'path' 或 'base64'", "ERROR", True)
+            _log("imageSource 缺少 'path' 或 'base64'", "ERROR", True, tag="[ImageAnalyzer]")
             return None
 
         return self._callApi(base64Data, imageFormat)
@@ -427,7 +415,7 @@ class ImageAnalyzer:
         if not imageSources:
             return []
 
-        _log(f"开始并发分析 {len(imageSources)} 张图片（并发数: {self.maxConcurrent}）", "INFO", self.verbose)
+        _log(f"开始并发分析 {len(imageSources)} 张图片（并发数: {self.maxConcurrent}）", "INFO", self.verbose, tag="[ImageAnalyzer]")
 
         results = [None] * len(imageSources)
 
@@ -441,11 +429,11 @@ class ImageAnalyzer:
                 try:
                     results[idx] = future.result()
                 except Exception as e:
-                    _log(f"图片分析异常 (index={idx}): {e}", "ERROR", True)
+                    _log(f"图片分析异常 (index={idx}): {e}", "ERROR", True, tag="[ImageAnalyzer]")
                     results[idx] = None
 
         successCount = sum(1 for r in results if r is not None)
-        _log(f"图片分析完成: {successCount}/{len(imageSources)} 成功", "INFO", self.verbose)
+        _log(f"图片分析完成: {successCount}/{len(imageSources)} 成功", "INFO", self.verbose, tag="[ImageAnalyzer]")
         return results
 
     def analyzeImageWithCallback(

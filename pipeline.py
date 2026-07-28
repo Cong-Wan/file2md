@@ -1,5 +1,11 @@
 '''
 Author: wilbur
+Version: 3.2
+  Date: 2026-07-28
+  Description: 重构 Step1/2：模块迁入 core 包，日志/MD 后处理函数改为 core.logUtils/core.mdPostprocess 公开实现；
+               删除 9 个死函数（parsePdfOrImage、_stripOldAnalysisBlocks、_translateAndWrite、processImageAnalysis、
+               _parsePdfPages、_parseAndDispatchLoop、_finalizePdfPipeline、_shutdownExecutors、_runReanalyze）
+
 Version: 3.1
   Date: 2026-05-21
   Description: 改为按页提交解析后处理任务，支持 cache-only 后处理并行
@@ -54,9 +60,7 @@ import sys
 import re
 import time
 import argparse
-import shutil
 from pathlib import Path
-from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -64,8 +68,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from imageAnalyzer import ImageAnalyzer
-from cacheManager import CacheManager
+from core.imageAnalyzer import ImageAnalyzer
+from core.cacheManager import CacheManager
+from core.logUtils import log, logSeparator
+from core.mdPostprocess import (
+    applyImageMode,
+    buildFinalMarkdownFromCache,
+    extractImageSources,
+)
 
 
 # ============================================================
@@ -83,11 +93,6 @@ SUPPORTED_EXTENSIONS = {
     ".tif": "image",
     ".webp": "image",
 }
-
-# Markdown 图片引用正则
-IMAGE_REF_PATTERN = re.compile(r'(!\[[^\]]*\]\(([^)]+)\))')
-# Group 1: 完整的 ![alt](src)
-# Group 2: 图片路径或 data URI
 
 VALID_PIPELINE_TASKS = ("parse", "image", "translate")
 DEFAULT_PIPELINE_TASKS = ("parse", "image")
@@ -125,35 +130,6 @@ def validate_tasks(tasks: tuple[str, ...], clean_cache: bool) -> None:
     if clean_cache and "parse" not in tasks:
         joined = ",".join(tasks)
         raise ValueError(f"--tasks {joined} 不能和 --clean-cache 同用；clean-cache 后没有可后处理的解析缓存")
-
-
-# ============================================================
-# 日志工具
-# ============================================================
-
-def log(msg: str, level: str = "INFO", verbose: bool = True):
-    if not verbose and level == "DEBUG":
-        return
-    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    prefix = {
-        "INFO":  "\033[32m[INFO ]\033[0m",
-        "DEBUG": "\033[36m[DEBUG]\033[0m",
-        "WARN":  "\033[33m[WARN ]\033[0m",
-        "ERROR": "\033[31m[ERROR]\033[0m",
-        "STEP":  "\033[35m[STEP ]\033[0m",
-        "DONE":  "\033[34m[DONE ]\033[0m",
-    }.get(level, "[????]")
-    print(f"{timestamp} {prefix} {msg}", flush=True)
-
-
-def logSeparator(title: str = "", verbose: bool = True):
-    if not verbose:
-        return
-    pad = (58 - len(title)) // 2
-    if title:
-        print(f"\033[35m{'=' * pad} {title} {'=' * (58 - pad - len(title))}\033[0m", flush=True)
-    else:
-        print(f"\033[35m{'=' * 60}\033[0m", flush=True)
 
 
 # ============================================================
@@ -211,201 +187,8 @@ def parseDocx(inputPath: str, outputDir: str, outputFileName: str, verbose: bool
 
 
 # ============================================================
-# Step 1b: PDF/Image 解析
-# ============================================================
-
-def parsePdfOrImage(inputPath: str, outputDir: str, pdfApiUrl: str,
-                    pdfModelName: str, dpi: int, serverTimeout: int,
-                    verbose: bool,
-                    onImageExtracted: "callable | None" = None) -> str:
-    """调用 parseFlowApi 模块解析 PDF 或 Image 文件。
-
-    参数:
-        inputPath: 输入文件路径
-        outputDir: 输出目录
-        pdfApiUrl: MinerU API 地址
-        pdfModelName: MinerU 模型名
-        dpi: PDF 渲染 DPI
-        serverTimeout: API 超时秒数
-        verbose: 是否输出详细日志
-
-    返回:
-        Markdown 文本
-    """
-    logSeparator("PDF/Image 解析", verbose)
-    from parseFlowApi import convertPdfOrImage
-
-    log(f"解析 PDF/Image: {inputPath}", "INFO", verbose)
-    markdown, imagePaths = convertPdfOrImage(
-        inputPath=inputPath,
-        outputDir=outputDir,
-        apiUrl=pdfApiUrl.rstrip("/"),
-        modelName=pdfModelName,
-        dpi=dpi,
-        serverTimeout=serverTimeout,
-        verbose=verbose,
-        imageDirName="images",
-        onImageExtracted=onImageExtracted,
-    )
-    log(f"PDF/Image 解析完成，Markdown 长度: {len(markdown)}，图片数: {len(imagePaths)}", "INFO", verbose)
-    return markdown
-
-
-# ============================================================
-# Step 2: 图像理解后处理
-# ============================================================
-
-def _isDataUri(src: str) -> bool:
-    """判断是否为 data URI。"""
-    return src.startswith("data:image/")
-
-
-def _extractImageSources(markdown: str, outputDir: str, verbose: bool) -> list[tuple[int, dict]]:
-    """从 Markdown 中提取所有图片引用及其 source 信息。
-
-    返回: [(行索引, imageSource dict), ...]
-    使用 finditer 支持同一行中的多个图片引用。
-    """
-    lines = markdown.split("\n")
-    sources = []
-    for lineIdx, line in enumerate(lines):
-        for match in IMAGE_REF_PATTERN.finditer(line):
-            src = match.group(2)
-            if _isDataUri(src):
-                # data:image/png;base64,xxxxx
-                headerEnd = src.index(",") + 1
-                base64Data = src[headerEnd:]
-                # 推断格式
-                fmt = "png"
-                if "jpeg" in src or "jpg" in src:
-                    fmt = "jpeg"
-                elif "webp" in src:
-                    fmt = "webp"
-                sources.append((lineIdx, {"base64": base64Data, "format": fmt}))
-            else:
-                # 文件路径（相对路径）
-                absPath = os.path.normpath(os.path.join(outputDir, src))
-                fmt = "png"
-                if src.lower().endswith((".jpg", ".jpeg")):
-                    fmt = "jpeg"
-                elif src.lower().endswith(".webp"):
-                    fmt = "webp"
-                sources.append((lineIdx, {"path": absPath, "format": fmt}))
-
-    log(f"发现 {len(sources)} 个图片引用", "INFO", verbose)
-    return sources
-
-
-def _buildAnalysisBlock(result: dict) -> str:
-    """将图像分析结果构建为 Markdown 文本块。"""
-    imgType = result.get("type", "document")
-    content = result.get("content", "")
-    summary = result.get("summary", "")
-
-    lines = []
-
-    if imgType == "flowchart":
-        # 流程图：summary + mermaid 代码块
-        header = f"> **[图像分析 - 流程图]** {summary}" if summary else "> **[图像分析 - 流程图]**"
-        lines.append(header)
-        lines.append(">")
-        # Mermaid 代码块转义：处理 triple backticks
-        safeContent = content.replace("```", "```")
-        mermaidLines = safeContent.split("\n")
-        lines.append("> ```mermaid")
-        for ml in mermaidLines:
-            lines.append(f"> {ml}")
-        lines.append("> ```")
-    else:
-        # 文档/图表：summary + content
-        header = f"> **[图像分析]** {summary}" if summary else "> **[图像分析]**"
-        lines.append(header)
-        if content:
-            lines.append(">")
-            for contentLine in content.split("\n"):
-                lines.append(f"> {contentLine}")
-
-    return "\n".join(lines)
-
-
-def _stripOldAnalysisBlocks(markdown: str) -> str:
-    """移除 Markdown 中已有的图像分析结果块。
-
-    分析块特征: 以 "> **[图像分析" 开头的 blockquote 块。
-    由于 _buildAnalysisBlock 统一使用 > 前缀，只需跳过连续 > 行和空行即可。
-    """
-    ANALYSIS_HEADER = re.compile(r'^>\s*\*\*\[图像分析')
-    lines = markdown.split("\n")
-    result = []
-    i = 0
-    while i < len(lines):
-        if ANALYSIS_HEADER.match(lines[i]):
-            # 跳过整个分析块：header + 后续连续的 > 行 + 空行
-            i += 1
-            while i < len(lines):
-                stripped = lines[i].strip()
-                if stripped == "" or stripped.startswith(">"):
-                    i += 1
-                else:
-                    break
-        else:
-            result.append(lines[i])
-            i += 1
-    return "\n".join(result)
-
-
-def _buildFinalMarkdownFromCache(pageData: dict, outputDir: str, verbose: bool) -> str:
-    """从缓存中的页数据生成包含分析结果的最终 markdown。"""
-    rawMd = pageData["rawMarkdown"]
-    images = pageData.get("images", [])
-
-    if not images:
-        return rawMd
-
-    analysisResults = {}
-    for img in images:
-        absPath = img.get("absPath")
-        if absPath and img.get("analysisResult") is not None:
-            analysisResults[absPath] = img["analysisResult"]
-
-    if analysisResults:
-        return _insertAnalysisResults(rawMd, outputDir, analysisResults, verbose)
-    return rawMd
-
-
-# ============================================================
 # 异步 worker 函数（各自自管异常，主线程从不 future.result）
 # ============================================================
-
-def _translateAndWrite(
-    pageNum: int,
-    rawText: str,
-    translator,
-    cache,
-    writer,
-    verbose: bool,
-) -> None:
-    """翻译一页 + 更新缓存 + 按序写入 _cn.md。
-    整个函数跑在翻译线程池 worker 里，主线程 submit 后立即返回。
-    任何异常都在本函数内吞掉并降级为 submitFailed。
-    """
-    try:
-        result = translator.translate(rawText)
-        cache.updateTranslationResult(pageNum, result)
-        if result:
-            writer.submit(pageNum, result)
-            log(f"  ✓ 第 {pageNum} 页翻译完成并已写入 _cn.md", "INFO", verbose)
-        else:
-            writer.submitFailed(pageNum, rawText)
-            log(f"  ✗ 第 {pageNum} 页翻译失败，已用原文占位", "WARN", True)
-    except Exception as e:
-        log(f"  ✗ 第 {pageNum} 页翻译 worker 异常: {e}", "ERROR", True)
-        try:
-            cache.updateTranslationResult(pageNum, None)
-            writer.submitFailed(pageNum, rawText)
-        except Exception as ee:
-            log(f"  ✗ 第 {pageNum} 页异常降级也失败: {ee}", "ERROR", True)
-
 
 def _analyzeAndCache(
     pageNum: int,
@@ -429,95 +212,6 @@ def _analyzeAndCache(
             cache.updateImageResult(pageNum, imageId, None)
         except Exception:
             pass
-
-
-def _insertAnalysisResults(
-    markdown: str,
-    outputDir: str,
-    analysisResults: dict,
-    verbose: bool,
-    indexBased: bool = False,
-    indexResults: list | None = None,
-) -> str:
-    """将预计算的图像分析结果插入 Markdown。"""
-    imageSources = _extractImageSources(markdown, outputDir, verbose)
-    if not imageSources:
-        return markdown
-
-    lines = markdown.split("\n")
-    insertions = []
-    for i, (lineIdx, src) in enumerate(imageSources):
-        if indexBased and indexResults is not None:
-            result = indexResults[i] if i < len(indexResults) else None
-        else:
-            absPath = src.get("path")
-            result = analysisResults.get(absPath) if absPath else None
-        if result is not None:
-            block = _buildAnalysisBlock(result)
-            insertions.append((lineIdx, block))
-            log(f"图片[{i}] 分析成功: type={result.get('type')}", "DEBUG", verbose)
-        else:
-            log(f"图片[{i}] 无分析结果，保留原始图片引用", "WARN", verbose)
-
-    # 倒序插入
-    for lineIdx, block in sorted(insertions, key=lambda x: x[0], reverse=True):
-        lines.insert(lineIdx, block + "\n")
-
-    return "\n".join(lines)
-
-
-def processImageAnalysis(
-    markdown: str,
-    outputDir: str,
-    analyzer: ImageAnalyzer,
-    verbose: bool,
-) -> str:
-    """对 Markdown 中的图片批量执行图像理解并插入分析结果。"""
-    logSeparator("图像理解分析（批量）", verbose)
-
-    imageSources = _extractImageSources(markdown, outputDir, verbose)
-    if not imageSources:
-        log("文档中无图片引用，跳过图像分析", "INFO", verbose)
-        return markdown
-
-    sourcesOnly = [src for _, src in imageSources]
-    results = analyzer.analyzeImages(sourcesOnly)
-
-    return _insertAnalysisResults(
-        markdown, outputDir,
-        analysisResults={},
-        verbose=verbose,
-        indexBased=True,
-        indexResults=results,
-    )
-
-
-# ============================================================
-# Step 3: image-mode 后处理
-# ============================================================
-
-def applyImageMode(markdown: str, outputDir: str, imageMode: str,
-                   verbose: bool) -> str:
-    """根据 image-mode 处理最终输出。"""
-    if imageMode == "base64":
-        log("image-mode=base64: 尚未实现，保留图片引用不变", "WARN", verbose)
-    elif imageMode == "none":
-        log("image-mode=none: 移除图片引用并清理图片文件", "STEP", verbose)
-        lines = markdown.split("\n")
-        filtered = []
-        for line in lines:
-            if IMAGE_REF_PATTERN.search(line):
-                log(f"  移除图片引用: {line.strip()[:80]}", "DEBUG", verbose)
-                continue
-            filtered.append(line)
-        markdown = "\n".join(filtered)
-
-        imagesDir = os.path.join(outputDir, "images")
-        if os.path.isdir(imagesDir):
-            shutil.rmtree(imagesDir)
-            log(f"  已删除图片目录: {imagesDir}", "INFO", verbose)
-
-    return markdown
 
 
 # ============================================================
@@ -686,45 +380,6 @@ def _writeTextFile(path: str, content: str) -> None:
         os.fsync(f.fileno())
 
 
-def _parsePdfPages(ctx: PdfPipelineContext) -> None:
-    from parseFlowApi import createMinerUClient, loadInputImages, parseSinglePage
-
-    logSeparator("PDF/Image 解析（任务模式）", ctx.verbose)
-    client = createMinerUClient(
-        apiUrl=ctx.args.pdf_api_url.rstrip("/"),
-        modelName=ctx.args.pdf_api_model,
-        serverTimeout=ctx.args.server_timeout,
-        verbose=ctx.verbose,
-    )
-    pageImages = loadInputImages(ctx.inputPath, ctx.args.dpi, ctx.verbose)
-    breakpoint = ctx.cache.findBreakpoint()
-    log(f"共 {len(pageImages)} 页，从第 {breakpoint} 页开始解析", "INFO", ctx.verbose)
-
-    for pageNum, img in pageImages:
-        if pageNum < breakpoint:
-            continue
-        rawMd, absPaths = parseSinglePage(client, pageNum, img, ctx.imageDir, ctx.verbose)
-        images = []
-        for i, absPath in enumerate(absPaths):
-            fmt = "png"
-            if absPath.lower().endswith((".jpg", ".jpeg")):
-                fmt = "jpeg"
-            elif absPath.lower().endswith(".webp"):
-                fmt = "webp"
-            images.append({
-                "imageId": f"p{pageNum:03d}_img{i:02d}",
-                "relPath": f"images/{Path(absPath).name}",
-                "absPath": absPath,
-                "analysisStatus": "pending",
-                "format": fmt,
-            })
-        ctx.cache.addPage(pageNum, rawMd, images)
-        log(f"第 {pageNum} 页解析结果已写入缓存", "INFO", ctx.verbose)
-
-    _writeTextFile(ctx.outputPath, ctx.cache.rebuildMarkdown())
-    log(f"解析输出已重建: {ctx.outputPath}", "DONE", ctx.verbose)
-
-
 def _runImageTask(ctx: PdfPipelineContext, apiKey: str) -> None:
     _requireParsedCache(ctx, "image")
     if not apiKey:
@@ -796,7 +451,7 @@ def _finalizeImageOutput(ctx: PdfPipelineContext) -> None:
     for page in ctx.cache._data["pages"]:
         if page.get("parseStatus") != "completed":
             continue
-        finalMd = _buildFinalMarkdownFromCache(page, ctx.outputDir, ctx.verbose)
+        finalMd = buildFinalMarkdownFromCache(page, ctx.outputDir, ctx.verbose)
         ctx.cache.finalizePage(page["pageNum"], finalMd)
     _writeTextFile(ctx.outputPath, ctx.cache.rebuildMarkdown())
     log(f"图片理解输出已重建: {ctx.outputPath}", "DONE", ctx.verbose)
@@ -825,7 +480,7 @@ def _createImageAnalyzer(ctx: PdfPipelineContext, apiKey: str):
 def _createTranslator(ctx: PdfPipelineContext, translateApiUrl: str, translateApiKey: str):
     if not translateApiKey or not translateApiUrl:
         return None
-    from translator import Translator
+    from core.translator import Translator
 
     return Translator(
         apiUrl=translateApiUrl,
@@ -857,7 +512,7 @@ def _runTranslateTask(ctx: PdfPipelineContext, translateApiUrl: str, translateAp
         log("未配置 TRANSLATE_API_URL 或 TRANSLATE_API_KEY，无法执行 translate 任务", "WARN", True)
         return
 
-    from translator import Translator
+    from core.translator import Translator
 
     translator = Translator(
         apiUrl=translateApiUrl,
@@ -890,7 +545,7 @@ def _runTranslateTask(ctx: PdfPipelineContext, translateApiUrl: str, translateAp
 
 
 def _runParsePipelineTask(ctx: PdfPipelineContext, apiKey: str, translateApiUrl: str, translateApiKey: str) -> None:
-    from parseFlowApi import createMinerUClient, loadInputImages, parseSinglePage
+    from core.parseFlowApi import createMinerUClient, loadInputImages, parseSinglePage
 
     logSeparator("PDF/Image 解析（任务模式）", ctx.verbose)
     client = createMinerUClient(
@@ -1000,167 +655,6 @@ def _runCacheOnlyPostprocessors(ctx: PdfPipelineContext, apiKey: str, translateA
         raise translateError
 
 
-def _parseAndDispatchLoop(ctx: PdfPipelineContext) -> None:
-    """主线程纯生产者循环：解析页面 + 非阻塞派发图像分析和翻译任务。
-    NEVER blocks on futures.
-    """
-    from parseFlowApi import parseSinglePage
-
-    cache = ctx.cache
-    breakpoint = ctx.breakpoint
-    pageImages = ctx.pageImages
-    totalPagesEstimate = len(pageImages)
-    isFirstWrittenPage = (breakpoint == 1)
-
-    # ── 阶段 A：断点续传 —— 为已 completed 但翻译未完成/失败的页面补充提交翻译 ──
-    if ctx.translator and ctx.translateExecutor and ctx.writer:
-        for page in cache._data["pages"]:
-            pageNum = page["pageNum"]
-            if page.get("status") != "completed":
-                continue
-            tStatus = page.get("translationStatus", "pending")
-            if tStatus not in ("pending", "failed"):
-                continue
-            rawMd = page.get("rawMarkdown", "")
-            log(f"断点续传：补充第 {pageNum} 页翻译任务", "INFO", ctx.verbose)
-            ctx.translateExecutor.submit(
-                _translateAndWrite,
-                pageNum, rawMd, ctx.translator, cache, ctx.writer, ctx.verbose,
-            )
-
-    # ── 阶段 B：主循环 —— 从断点开始逐页解析 + 非阻塞派发 ──
-    for idx, (pageNum, img) in enumerate(pageImages):
-        if pageNum < breakpoint:
-            continue
-
-        log(f"处理第 {pageNum}/{totalPagesEstimate} 页...", "STEP", ctx.verbose)
-
-        # 解析该页
-        rawMd, absPaths = parseSinglePage(
-            ctx.client, pageNum, img, ctx.imageDir, ctx.verbose,
-        )
-
-        # 构造图片信息列表
-        images = []
-        for i, absPath in enumerate(absPaths):
-            fmt = "png"
-            if absPath.lower().endswith((".jpg", ".jpeg")):
-                fmt = "jpeg"
-            elif absPath.lower().endswith(".webp"):
-                fmt = "webp"
-            images.append({
-                "imageId": f"p{pageNum:03d}_img{i:02d}",
-                "relPath": f"images/{Path(absPath).name}",
-                "absPath": absPath,
-                "status": "pending",
-                "format": fmt,
-            })
-
-        # 注册到缓存
-        cache.addPage(pageNum, rawMd, images)
-
-        # 主线程唯一的 .md 写入点
-        finalMd = rawMd
-        cache.finalizePage(pageNum, finalMd)
-
-        with open(ctx.outputPath, "a", encoding="utf-8") as f:
-            if not isFirstWrittenPage:
-                f.write("\n\n---\n\n")
-            f.write(finalMd)
-            f.flush()
-            os.fsync(f.fileno())
-
-        isFirstWrittenPage = False
-        cache.markPageWritten(pageNum)
-        log(f"第 {pageNum} 页已写入", "INFO", ctx.verbose)
-
-        # 非阻塞：提交图片分析任务到 imageExecutor
-        if ctx.analyzer and ctx.imageExecutor and images:
-            for imgInfo in images:
-                ctx.imageExecutor.submit(
-                    _analyzeAndCache,
-                    pageNum, imgInfo["imageId"],
-                    {"path": imgInfo["absPath"], "format": imgInfo["format"]},
-                    ctx.analyzer, cache, ctx.verbose,
-                )
-            log(f"  已提交 {len(images)} 个图片分析任务（异步）", "DEBUG", ctx.verbose)
-
-        # 非阻塞：提交翻译任务到 translateExecutor
-        if ctx.translator and ctx.translateExecutor and ctx.writer:
-            pageData = cache.getPage(pageNum)
-            existingStatus = pageData.get("translationStatus", "pending")
-            if existingStatus == "completed":
-                log(f"  第 {pageNum} 页已翻译，跳过", "DEBUG", ctx.verbose)
-            else:
-                textToTranslate = pageData.get("rawMarkdown", "")
-                ctx.translateExecutor.submit(
-                    _translateAndWrite,
-                    pageNum, textToTranslate,
-                    ctx.translator, cache, ctx.writer, ctx.verbose,
-                )
-                log(f"  → 提交第 {pageNum} 页翻译（异步）", "DEBUG", ctx.verbose)
-
-
-def _finalizePdfPipeline(ctx: PdfPipelineContext) -> None:
-    """等待所有异步任务完成 + 重建 .md 文件（含图像分析结果）。"""
-    needRewrite = False
-
-    # 等待图片分析完成 + 重建 .md
-    if ctx.imageExecutor:
-        logSeparator("等待图片分析完成", ctx.verbose)
-        ctx.imageExecutor.shutdown(wait=True)
-        log("图像分析线程池已关闭", "DEBUG", ctx.verbose)
-
-        # 遍历所有 completed 页面，用图像分析结果重建 finalMarkdown
-        for page in ctx.cache._data["pages"]:
-            pageNum = page["pageNum"]
-            if page.get("status") != "completed":
-                continue
-            finalMd = _buildFinalMarkdownFromCache(page, ctx.outputDir, ctx.verbose)
-            if finalMd != page.get("rawMarkdown"):
-                ctx.cache.finalizePage(pageNum, finalMd)
-                needRewrite = True
-
-        if needRewrite:
-            completedPages = ctx.cache.getCompletedPages()
-            if completedPages:
-                rebuilt = ctx.cache.rebuildMarkdown(max(completedPages))
-                with open(ctx.outputPath, "w", encoding="utf-8") as f:
-                    f.write(rebuilt)
-                log("已重写输出文件以包含图像分析结果", "INFO", ctx.verbose)
-
-    # 等待翻译完成
-    if ctx.translateExecutor:
-        logSeparator("等待翻译完成", ctx.verbose)
-        ctx.translateExecutor.shutdown(wait=True)
-        log("翻译线程池已关闭", "DEBUG", ctx.verbose)
-
-    # 检查 writer 是否有未刷出的页面
-    if ctx.writer:
-        pending = ctx.writer.getPendingPages()
-        if pending:
-            log(f"WARNING: OrderedMarkdownWriter 仍有未刷出页面: {pending}", "ERROR", True)
-        else:
-            if ctx.cnOutputPath:
-                log(f"翻译文件已写入: {ctx.cnOutputPath}", "DONE", ctx.verbose)
-
-
-def _shutdownExecutors(ctx: PdfPipelineContext) -> None:
-    """finally 安全网：确保线程池关闭。"""
-    if ctx.imageExecutor is not None:
-        try:
-            ctx.imageExecutor.shutdown(wait=True)
-            log("图像分析线程池已关闭（finally）", "DEBUG", ctx.verbose)
-        except Exception as e:
-            log(f"线程池关闭异常: {e}", "ERROR", True)
-    if ctx.translateExecutor is not None:
-        try:
-            ctx.translateExecutor.shutdown(wait=True)
-            log("翻译线程池已关闭（finally）", "DEBUG", ctx.verbose)
-        except Exception as e:
-            log(f"线程池关闭异常: {e}", "ERROR", True)
-
-
 def _runPdfOrImage(
     inputPath, outputDir, outputPath, cache, apiKey,
     enableTranslation, translateApiUrl, translateApiKey, args, verbose,
@@ -1197,7 +691,7 @@ def _runDocx(inputPath, outputDir, outputPath, outputFileName, cache, apiKey, ar
         markdown = parseDocx(inputPath, outputDir, outputFileName, verbose)
 
         # 提取图片信息
-        imageSources = _extractImageSources(markdown, outputDir, verbose)
+        imageSources = extractImageSources(markdown, outputDir, verbose)
         images = []
         for i, (_, src) in enumerate(imageSources):
             absPath = src.get("path", "")
@@ -1247,48 +741,13 @@ def _runDocx(inputPath, outputDir, outputPath, outputFileName, cache, apiKey, ar
                     log(f"图片 {imgInfo['imageId']} 分析成功", "DEBUG", verbose)
 
         # 生成 finalMarkdown
-        finalMd = _buildFinalMarkdownFromCache(cache._data["docx"], outputDir, verbose)
+        finalMd = buildFinalMarkdownFromCache(cache._data["docx"], outputDir, verbose)
         cache.setDocxFinal(finalMd)
 
         # 覆写 .md
         with open(outputPath, "w", encoding="utf-8") as f:
             f.write(finalMd)
         log("DOCX 最终 Markdown 已写出", "INFO", verbose)
-
-    # image-mode 后处理
-    _applyImageModeToFile(outputPath, outputDir, args.image_mode, verbose)
-
-
-def _runReanalyze(cache, outputDir, outputPath, outputFileName, apiKey, args, verbose):
-    """重分析模式。"""
-    existingOutputPath = outputPath
-    if not os.path.isfile(existingOutputPath):
-        log(f"重分析模式需要已有输出文件: {existingOutputPath}", "ERROR", True)
-        sys.exit(1)
-
-    with open(existingOutputPath, "r", encoding="utf-8") as f:
-        markdown = f.read()
-    log(f"已读取已有输出: {existingOutputPath}，长度: {len(markdown)}", "INFO", verbose)
-
-    # 移除旧的分析块
-    markdown = _stripOldAnalysisBlocks(markdown)
-    log("已移除旧的图像分析结果块", "INFO", verbose)
-
-    if apiKey:
-        analyzer = ImageAnalyzer(
-            apiUrl=args.image_api_url,
-            apiKey=apiKey,
-            model=args.image_api_model,
-            maxConcurrent=args.max_concurrent,
-            maxRetry=args.retry,
-            retryDelay=args.retry_delay,
-            verbose=verbose,
-        )
-        markdown = processImageAnalysis(markdown, outputDir, analyzer, verbose)
-
-    # 写出
-    with open(outputPath, "w", encoding="utf-8") as f:
-        f.write(markdown)
 
     # image-mode 后处理
     _applyImageModeToFile(outputPath, outputDir, args.image_mode, verbose)
