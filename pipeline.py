@@ -1,5 +1,13 @@
 '''
 Author: wilbur
+Version: 3.3
+  Date: 2026-07-28
+  Description: 重构 Step3 去重复：图片格式推断改用 core.mdPostprocess.guessImageFormat；
+               新增 buildImageInfo helper 统一图片 info dict 构造；
+               _runImageTask/_runTranslateTask/_runDocx 复用 _createImageAnalyzer/_createTranslator；
+               _submitImageFutures 签名改为 (page, img) 对列表，供 parse/image 两处复用；
+               _runTranslateTask 提交复用 _submitTranslationFuture
+
 Version: 3.2
   Date: 2026-07-28
   Description: 重构 Step1/2：模块迁入 core 包，日志/MD 后处理函数改为 core.logUtils/core.mdPostprocess 公开实现；
@@ -75,6 +83,7 @@ from core.mdPostprocess import (
     applyImageMode,
     buildFinalMarkdownFromCache,
     extractImageSources,
+    guessImageFormat,
 )
 
 
@@ -387,51 +396,31 @@ def _runImageTask(ctx: PdfPipelineContext, apiKey: str) -> None:
         _writeTextFile(ctx.outputPath, ctx.cache.rebuildMarkdown())
         return
 
-    analyzer = ImageAnalyzer(
-        apiUrl=ctx.args.image_api_url,
-        apiKey=apiKey,
-        model=ctx.args.image_api_model,
-        maxConcurrent=ctx.args.max_concurrent,
-        maxRetry=ctx.args.retry,
-        retryDelay=ctx.args.retry_delay,
-        verbose=ctx.verbose,
-    )
+    analyzer = _createImageAnalyzer(ctx.args, apiKey, ctx.verbose)
     pending = list(ctx.cache.iterPendingImages())
     log(f"待分析图片: {len(pending)}", "INFO", ctx.verbose)
 
     with ThreadPoolExecutor(max_workers=analyzer.maxConcurrent) as executor:
-        futures = []
-        for page, img in pending:
-            ctx.cache.markImageRunning(page["pageNum"], img["imageId"])
-            futures.append(executor.submit(
-                _analyzeAndCache,
-                page["pageNum"],
-                img["imageId"],
-                {"path": img["absPath"], "format": img.get("format", "png")},
-                analyzer,
-                ctx.cache,
-                ctx.verbose,
-            ))
+        futures = _submitImageFutures(ctx, analyzer, executor, pending)
         for future in futures:
             future.result()
 
     _finalizeImageOutput(ctx)
 
 
-def _submitImageFutures(ctx: PdfPipelineContext, analyzer, executor, pagesWithImages) -> list:
+def _submitImageFutures(ctx: PdfPipelineContext, analyzer, executor, pendingPairs) -> list:
     futures = []
-    for page, images in pagesWithImages:
-        for img in images:
-            ctx.cache.markImageRunning(page["pageNum"], img["imageId"])
-            futures.append(executor.submit(
-                _analyzeAndCache,
-                page["pageNum"],
-                img["imageId"],
-                {"path": img["absPath"], "format": img.get("format", "png")},
-                analyzer,
-                ctx.cache,
-                ctx.verbose,
-            ))
+    for page, img in pendingPairs:
+        ctx.cache.markImageRunning(page["pageNum"], img["imageId"])
+        futures.append(executor.submit(
+            _analyzeAndCache,
+            page["pageNum"],
+            img["imageId"],
+            {"path": img["absPath"], "format": img.get("format", "png")},
+            analyzer,
+            ctx.cache,
+            ctx.verbose,
+        ))
     return futures
 
 
@@ -463,17 +452,17 @@ def _finalizeTranslationOutput(ctx: PdfPipelineContext) -> None:
         log(f"翻译输出已重建: {ctx.cnOutputPath}", "DONE", ctx.verbose)
 
 
-def _createImageAnalyzer(ctx: PdfPipelineContext, apiKey: str):
+def _createImageAnalyzer(args, apiKey: str, verbose: bool):
     if not apiKey:
         return None
     return ImageAnalyzer(
-        apiUrl=ctx.args.image_api_url,
+        apiUrl=args.image_api_url,
         apiKey=apiKey,
-        model=ctx.args.image_api_model,
-        maxConcurrent=ctx.args.max_concurrent,
-        maxRetry=ctx.args.retry,
-        retryDelay=ctx.args.retry_delay,
-        verbose=ctx.verbose,
+        model=args.image_api_model,
+        maxConcurrent=args.max_concurrent,
+        maxRetry=args.retry,
+        retryDelay=args.retry_delay,
+        verbose=verbose,
     )
 
 
@@ -512,36 +501,29 @@ def _runTranslateTask(ctx: PdfPipelineContext, translateApiUrl: str, translateAp
         log("未配置 TRANSLATE_API_URL 或 TRANSLATE_API_KEY，无法执行 translate 任务", "WARN", True)
         return
 
-    from core.translator import Translator
-
-    translator = Translator(
-        apiUrl=translateApiUrl,
-        apiKey=translateApiKey,
-        model=ctx.args.translate_api_model,
-        maxConcurrent=ctx.args.max_concurrent_translate,
-        maxRetry=ctx.args.translate_retry,
-        retryDelay=ctx.args.translate_retry_delay,
-        verbose=ctx.verbose,
-    )
+    translator = _createTranslator(ctx, translateApiUrl, translateApiKey)
     pending = list(ctx.cache.iterPendingTranslations())
     log(f"待翻译页面: {len(pending)}", "INFO", ctx.verbose)
 
     with ThreadPoolExecutor(max_workers=translator.maxConcurrent) as executor:
         futures = []
         for page in pending:
-            ctx.cache.markTranslationRunning(page["pageNum"])
-            futures.append(executor.submit(
-                _translateAndCache,
-                page["pageNum"],
-                page.get("rawMarkdown", ""),
-                translator,
-                ctx.cache,
-                ctx.verbose,
-            ))
+            futures.append(_submitTranslationFuture(ctx, translator, executor, page))
         for future in futures:
             future.result()
 
     _finalizeTranslationOutput(ctx)
+
+
+def buildImageInfo(pageNum: int, idx: int, absPath: str) -> dict:
+    """构造单张图片的 info dict（解析缓存格式）。"""
+    return {
+        "imageId": f"p{pageNum:03d}_img{idx:02d}",
+        "relPath": f"images/{Path(absPath).name}",
+        "absPath": absPath,
+        "analysisStatus": "pending",
+        "format": guessImageFormat(absPath),
+    }
 
 
 def _runParsePipelineTask(ctx: PdfPipelineContext, apiKey: str, translateApiUrl: str, translateApiKey: str) -> None:
@@ -558,7 +540,7 @@ def _runParsePipelineTask(ctx: PdfPipelineContext, apiKey: str, translateApiUrl:
     breakpoint = ctx.cache.findBreakpoint()
     log(f"共 {len(pageImages)} 页，从第 {breakpoint} 页开始解析", "INFO", ctx.verbose)
 
-    analyzer = _createImageAnalyzer(ctx, apiKey) if "image" in ctx.tasks else None
+    analyzer = _createImageAnalyzer(ctx.args, apiKey, ctx.verbose) if "image" in ctx.tasks else None
     translator = _createTranslator(ctx, translateApiUrl, translateApiKey) if "translate" in ctx.tasks else None
 
     if "image" in ctx.tasks and analyzer is None:
@@ -576,26 +558,13 @@ def _runParsePipelineTask(ctx: PdfPipelineContext, apiKey: str, translateApiUrl:
             if pageNum < breakpoint:
                 continue
             rawMd, absPaths = parseSinglePage(client, pageNum, img, ctx.imageDir, ctx.verbose)
-            images = []
-            for i, absPath in enumerate(absPaths):
-                fmt = "png"
-                if absPath.lower().endswith((".jpg", ".jpeg")):
-                    fmt = "jpeg"
-                elif absPath.lower().endswith(".webp"):
-                    fmt = "webp"
-                images.append({
-                    "imageId": f"p{pageNum:03d}_img{i:02d}",
-                    "relPath": f"images/{Path(absPath).name}",
-                    "absPath": absPath,
-                    "analysisStatus": "pending",
-                    "format": fmt,
-                })
+            images = [buildImageInfo(pageNum, i, absPath) for i, absPath in enumerate(absPaths)]
             ctx.cache.addPage(pageNum, rawMd, images)
             page = ctx.cache.getPage(pageNum)
             log(f"第 {pageNum} 页解析结果已写入缓存", "INFO", ctx.verbose)
 
             if analyzer and imageExecutor and images and page:
-                imageFutures.extend(_submitImageFutures(ctx, analyzer, imageExecutor, [(page, images)]))
+                imageFutures.extend(_submitImageFutures(ctx, analyzer, imageExecutor, [(page, img) for img in images]))
                 log(f"第 {pageNum} 页已提交 {len(images)} 个图片理解任务", "DEBUG", ctx.verbose)
             if translator and translateExecutor and page:
                 translateFutures.append(_submitTranslationFuture(ctx, translator, translateExecutor, page))
@@ -717,15 +686,7 @@ def _runDocx(inputPath, outputDir, outputPath, outputFileName, cache, apiKey, ar
 
     # 图像分析
     if apiKey and images:
-        analyzer = ImageAnalyzer(
-            apiUrl=args.image_api_url,
-            apiKey=apiKey,
-            model=args.image_api_model,
-            maxConcurrent=args.max_concurrent,
-            maxRetry=args.retry,
-            retryDelay=args.retry_delay,
-            verbose=verbose,
-        )
+        analyzer = _createImageAnalyzer(args, apiKey, verbose)
 
         # 只分析 pending 状态的图片，使用并发批量分析
         pendingImages = [img for img in images if img["status"] == "pending"]
