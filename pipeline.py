@@ -1,5 +1,9 @@
 '''
 Author: wilbur
+Version: 3.5
+  Date: 2026-07-28
+  Description: 修正 --max-concurrent-translate 的 help 文案：默认值实为 5，原文案误写为 2
+
 Version: 3.4
   Date: 2026-07-28
   Description: 重构 Step4 逻辑理顺：砍 legacy 参数（--skip-image-analysis/--reanalyze-images/--enable-translation），
@@ -804,7 +808,7 @@ def buildArgParser() -> argparse.ArgumentParser:
 
     # 翻译功能
     parser.add_argument("--max-concurrent-translate", type=int, default=5,
-                        help="最大并发翻译请求数（默认: 2）")
+                        help="最大并发翻译请求数（默认: 5）")
     parser.add_argument("--translate-retry", type=int, default=10,
                         help="翻译失败重试次数（默认: 10）")
     parser.add_argument("--translate-retry-delay", type=float, default=30.0,
