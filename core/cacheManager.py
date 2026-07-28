@@ -1,5 +1,11 @@
 '''
 Author: wilbur
+Version: 1.5
+  Date: 2026-07-28
+  Description: 重构 Step4：删除 _normalizeImage/_normalizePage/_migrateCacheData 迁移逻辑；
+               loadOrCreate 校验 version 与关键字段，不兼容则 WARN 重建；
+               DOCX 图片状态字段 status 统一为 analysisStatus
+
 Version: 1.4
   Date: 2026-07-28
   Description: 迁移至 core 包，日志改为 core.logUtils 统一实现并补 [CacheManager] tag
@@ -38,6 +44,8 @@ from core.logUtils import log as _log
 class CacheManager:
     """Pipeline 断点续传缓存管理器。"""
 
+    CACHE_VERSION = "3.0"
+
     def __init__(self, cachePath: str, inputPath: str, imageMode: str, verbose: bool = False):
         self.cachePath = cachePath
         self.inputPath = inputPath
@@ -57,7 +65,7 @@ class CacheManager:
 
     def _createNew(self) -> dict:
         return {
-            "version": "3.0",
+            "version": self.CACHE_VERSION,
             "createdAt": datetime.now().isoformat(),
             "inputFile": self.inputPath,
             "inputHash": self._computeFileHash(),
@@ -67,44 +75,15 @@ class CacheManager:
             "docx": None,
         }
 
-    def _normalizeImage(self, img: dict) -> dict:
-        normalized = dict(img)
-        oldStatus = normalized.pop("status", None)
-        normalized["analysisStatus"] = normalized.get("analysisStatus") or oldStatus or "pending"
-        normalized.setdefault("analysisResult", None)
-        normalized.setdefault("analysisUpdatedAt", None)
-        return normalized
-
-    def _normalizePage(self, page: dict) -> dict:
-        normalized = dict(page)
-        oldStatus = normalized.pop("status", None)
-        if "parseStatus" not in normalized:
-            normalized["parseStatus"] = "completed" if oldStatus == "completed" else (oldStatus or "pending")
-        normalized.setdefault("rawMarkdown", "")
-        if normalized.get("finalMarkdown") is None:
-            normalized["finalMarkdown"] = normalized.get("rawMarkdown", "")
-        normalized["images"] = [self._normalizeImage(img) for img in normalized.get("images", [])]
-        normalized.setdefault("translationStatus", "pending")
-        normalized.setdefault("translatedContent", None)
-        normalized.setdefault("translatedAt", None)
-        return normalized
-
-    def _migrateCacheData(self, data: dict) -> dict:
-        migrated = dict(data)
-        migrated["version"] = "3.0"
-        migrated["pages"] = [self._normalizePage(page) for page in migrated.get("pages", [])]
-        migrated.setdefault("docx", data.get("docx"))
-        migrated.setdefault("imageMode", self.imageMode)
-        migrated.setdefault("fileType", Path(self.inputPath).suffix.lstrip("."))
-        return migrated
-
     def loadOrCreate(self) -> dict:
         if os.path.isfile(self.cachePath):
             try:
                 with open(self.cachePath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                assert "version" in data
-                assert "inputHash" in data
+                if data.get("version") != self.CACHE_VERSION or not all(
+                    key in data for key in ("inputFile", "inputHash", "fileType", "imageMode", "pages", "docx")
+                ):
+                    raise ValueError("缓存版本或关键字段不兼容")
                 currentHash = self._computeFileHash()
                 if data["inputHash"] != currentHash:
                     _log("输入文件已变更，清空缓存", "WARN", True, tag="[CacheManager]")
@@ -112,13 +91,9 @@ class CacheManager:
                     self.save()
                     return self._data
                 self._data = data
-                migrated = self._migrateCacheData(data)
-                self._data = migrated
-                if migrated != data:
-                    self.save()
                 _log(f"加载已有缓存: {len(self.getCompletedPages())} 页已完成", "INFO", self.verbose, tag="[CacheManager]")
                 return self._data
-            except (json.JSONDecodeError, AssertionError, KeyError) as e:
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
                 _log(f"缓存文件损坏({e})，重新创建", "WARN", True, tag="[CacheManager]")
                 self._data = self._createNew()
                 self.save()
@@ -148,7 +123,13 @@ class CacheManager:
 
     def addPage(self, pageNum: int, rawMarkdown: str, images: list[dict]) -> None:
         with self._lock:
-            normalizedImages = [self._normalizeImage(img) for img in images]
+            normalizedImages = []
+            for img in images:
+                normalized = dict(img)
+                normalized.setdefault("analysisStatus", "pending")
+                normalized.setdefault("analysisResult", None)
+                normalized.setdefault("analysisUpdatedAt", None)
+                normalizedImages.append(normalized)
             page = {
                 "pageNum": pageNum,
                 "parseStatus": "completed",
@@ -308,7 +289,7 @@ class CacheManager:
                 return
             for img in docx["images"]:
                 if img["imageId"] == imageId:
-                    img["status"] = "completed" if result is not None else "failed"
+                    img["analysisStatus"] = "completed" if result is not None else "failed"
                     img["analysisResult"] = result
                     break
             if docx["status"] == "parsed":

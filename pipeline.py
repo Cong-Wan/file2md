@@ -1,5 +1,12 @@
 '''
 Author: wilbur
+Version: 3.4
+  Date: 2026-07-28
+  Description: 重构 Step4 逻辑理顺：砍 legacy 参数（--skip-image-analysis/--reanalyze-images/--enable-translation），
+               parse_tasks 只解析 --tasks；删 _runPdfOrImage 的 enableTranslation 冗余参数；
+               新增 PipelineConfig dataclass，env 配置不再回写 args，下游统一从 ctx.config 读 API 配置；
+               DOCX 图片状态字段 status 统一为 analysisStatus（docx 顶层 status 三态保留）
+
 Version: 3.3
   Date: 2026-07-28
   Description: 重构 Step3 去重复：图片格式推断改用 core.mdPostprocess.guessImageFormat；
@@ -108,18 +115,12 @@ DEFAULT_PIPELINE_TASKS = ("parse", "image")
 
 
 def parse_tasks(args) -> tuple[str, ...]:
-    """Resolve explicit --tasks or legacy flags into an ordered task tuple."""
+    """解析 --tasks 为有序任务元组（空 → 默认 parse,image）。"""
     rawTasks = getattr(args, "tasks", "") or ""
     if rawTasks.strip():
         requested = [part.strip().lower() for part in rawTasks.split(",") if part.strip()]
-    elif getattr(args, "reanalyze_images", False):
-        requested = ["image"]
-    elif getattr(args, "skip_image_analysis", False):
-        requested = ["parse"]
     else:
         requested = list(DEFAULT_PIPELINE_TASKS)
-        if getattr(args, "enable_translation", False):
-            requested.append("translate")
 
     unknown = [task for task in requested if task not in VALID_PIPELINE_TASKS]
     if unknown:
@@ -227,6 +228,19 @@ def _analyzeAndCache(
 # 主流程
 # ============================================================
 
+@dataclass
+class PipelineConfig:
+    """从 .env 读取的 API 配置（显式传递，不回写 args）。"""
+    imageApiUrl: str
+    imageApiKey: str
+    imageApiModel: str
+    pdfApiUrl: str
+    pdfApiModel: str
+    translateApiUrl: str
+    translateApiKey: str
+    translateApiModel: str
+
+
 def runPipeline(args):
     """主管道流程（增量写入 + 断点续传版本）。"""
     verbose = args.verbose
@@ -260,10 +274,6 @@ def runPipeline(args):
         log(str(e), "ERROR", True)
         sys.exit(1)
 
-    if getattr(args, "tasks", "") and (
-        args.skip_image_analysis or args.reanalyze_images or args.enable_translation
-    ):
-        log("已提供 --tasks，忽略 --skip-image-analysis/--reanalyze-images/--enable-translation 兼容参数", "WARN", True)
     args.pipeline_tasks = tasks
     log(f"任务模式: {','.join(tasks)}", "INFO", verbose)
 
@@ -285,26 +295,24 @@ def runPipeline(args):
             log("未配置 IMAGE_API_KEY，跳过图像分析", "WARN", verbose)
 
     # 翻译 API 配置检查
-    enableTranslation = "translate" in args.pipeline_tasks
-    if enableTranslation:
+    if "translate" in args.pipeline_tasks:
         if not translateApiKey:
             translateApiKey = apiKey
         if not translateApiKey:
             log("未配置 TRANSLATE_API_KEY 且无 IMAGE_API_KEY，禁用翻译功能", "WARN", verbose)
-            enableTranslation = False
         if not translateApiUrl:
             log("未配置 TRANSLATE_API_URL，禁用翻译功能", "WARN", verbose)
-            enableTranslation = False
 
-    # 将 env 配置同步到 args（供下游函数使用）
-    args.image_api_url = imageApiUrl
-    args.image_api_key = imageApiKey
-    args.image_api_model = imageApiModel
-    args.pdf_api_url = pdfApiUrl
-    args.pdf_api_model = pdfApiModel
-    args.translate_api_url = translateApiUrl
-    args.translate_api_key = translateApiKey
-    args.translate_api_model = translateApiModel
+    config = PipelineConfig(
+        imageApiUrl=imageApiUrl,
+        imageApiKey=imageApiKey,
+        imageApiModel=imageApiModel,
+        pdfApiUrl=pdfApiUrl,
+        pdfApiModel=pdfApiModel,
+        translateApiUrl=translateApiUrl,
+        translateApiKey=translateApiKey,
+        translateApiModel=translateApiModel,
+    )
 
     # 初始化缓存
     cacheDir = os.path.join(outputDir, ".cache")
@@ -326,13 +334,10 @@ def runPipeline(args):
     log(f"文件类型: {fileType}", "INFO", verbose)
 
     if fileType == "docx":
-        _runDocx(inputPath, outputDir, outputPath, outputFileName, cache, apiKey, args, verbose)
+        _runDocx(inputPath, outputDir, outputPath, outputFileName, cache, apiKey, config, args, verbose)
 
     else:
-        _runPdfOrImage(
-            inputPath, outputDir, outputPath, cache, apiKey,
-            enableTranslation, translateApiUrl, translateApiKey, args, verbose,
-        )
+        _runPdfOrImage(inputPath, outputDir, outputPath, cache, apiKey, config, args, verbose)
 
     totalElapsed = time.time() - totalStart
     logSeparator("管道完成", verbose)
@@ -354,11 +359,12 @@ class PdfPipelineContext:
     cache: CacheManager
     tasks: tuple[str, ...]
     args: object = None
+    config: Optional[PipelineConfig] = None
     verbose: bool = False
     imageDir: Optional[Path] = None
 
 
-def _setupPdfPipeline(inputPath, outputDir, outputPath, cache, tasks, args, verbose) -> PdfPipelineContext:
+def _setupPdfPipeline(inputPath, outputDir, outputPath, cache, tasks, config, args, verbose) -> PdfPipelineContext:
     imageDir = Path(outputDir) / "images"
     imageDir.mkdir(parents=True, exist_ok=True)
     cnOutputPath = os.path.join(outputDir, f"{Path(outputPath).stem}_cn.md") if "translate" in tasks else None
@@ -371,6 +377,7 @@ def _setupPdfPipeline(inputPath, outputDir, outputPath, cache, tasks, args, verb
         cache=cache,
         tasks=tasks,
         args=args,
+        config=config,
         verbose=verbose,
         imageDir=imageDir,
     )
@@ -396,7 +403,7 @@ def _runImageTask(ctx: PdfPipelineContext, apiKey: str) -> None:
         _writeTextFile(ctx.outputPath, ctx.cache.rebuildMarkdown())
         return
 
-    analyzer = _createImageAnalyzer(ctx.args, apiKey, ctx.verbose)
+    analyzer = _createImageAnalyzer(ctx.config, ctx.args, apiKey, ctx.verbose)
     pending = list(ctx.cache.iterPendingImages())
     log(f"待分析图片: {len(pending)}", "INFO", ctx.verbose)
 
@@ -452,13 +459,13 @@ def _finalizeTranslationOutput(ctx: PdfPipelineContext) -> None:
         log(f"翻译输出已重建: {ctx.cnOutputPath}", "DONE", ctx.verbose)
 
 
-def _createImageAnalyzer(args, apiKey: str, verbose: bool):
+def _createImageAnalyzer(config: PipelineConfig, args, apiKey: str, verbose: bool):
     if not apiKey:
         return None
     return ImageAnalyzer(
-        apiUrl=args.image_api_url,
+        apiUrl=config.imageApiUrl,
         apiKey=apiKey,
-        model=args.image_api_model,
+        model=config.imageApiModel,
         maxConcurrent=args.max_concurrent,
         maxRetry=args.retry,
         retryDelay=args.retry_delay,
@@ -466,15 +473,15 @@ def _createImageAnalyzer(args, apiKey: str, verbose: bool):
     )
 
 
-def _createTranslator(ctx: PdfPipelineContext, translateApiUrl: str, translateApiKey: str):
-    if not translateApiKey or not translateApiUrl:
+def _createTranslator(ctx: PdfPipelineContext):
+    if not ctx.config.translateApiKey or not ctx.config.translateApiUrl:
         return None
     from core.translator import Translator
 
     return Translator(
-        apiUrl=translateApiUrl,
-        apiKey=translateApiKey,
-        model=ctx.args.translate_api_model,
+        apiUrl=ctx.config.translateApiUrl,
+        apiKey=ctx.config.translateApiKey,
+        model=ctx.config.translateApiModel,
         maxConcurrent=ctx.args.max_concurrent_translate,
         maxRetry=ctx.args.translate_retry,
         retryDelay=ctx.args.translate_retry_delay,
@@ -495,13 +502,13 @@ def _translateAndCache(pageNum: int, rawText: str, translator, cache, verbose: b
         cache.updateTranslationResult(pageNum, None)
 
 
-def _runTranslateTask(ctx: PdfPipelineContext, translateApiUrl: str, translateApiKey: str) -> None:
+def _runTranslateTask(ctx: PdfPipelineContext) -> None:
     _requireParsedCache(ctx, "translate")
-    if not translateApiKey or not translateApiUrl:
+    if not ctx.config.translateApiKey or not ctx.config.translateApiUrl:
         log("未配置 TRANSLATE_API_URL 或 TRANSLATE_API_KEY，无法执行 translate 任务", "WARN", True)
         return
 
-    translator = _createTranslator(ctx, translateApiUrl, translateApiKey)
+    translator = _createTranslator(ctx)
     pending = list(ctx.cache.iterPendingTranslations())
     log(f"待翻译页面: {len(pending)}", "INFO", ctx.verbose)
 
@@ -526,13 +533,13 @@ def buildImageInfo(pageNum: int, idx: int, absPath: str) -> dict:
     }
 
 
-def _runParsePipelineTask(ctx: PdfPipelineContext, apiKey: str, translateApiUrl: str, translateApiKey: str) -> None:
+def _runParsePipelineTask(ctx: PdfPipelineContext, apiKey: str) -> None:
     from core.parseFlowApi import createMinerUClient, loadInputImages, parseSinglePage
 
     logSeparator("PDF/Image 解析（任务模式）", ctx.verbose)
     client = createMinerUClient(
-        apiUrl=ctx.args.pdf_api_url.rstrip("/"),
-        modelName=ctx.args.pdf_api_model,
+        apiUrl=ctx.config.pdfApiUrl.rstrip("/"),
+        modelName=ctx.config.pdfApiModel,
         serverTimeout=ctx.args.server_timeout,
         verbose=ctx.verbose,
     )
@@ -540,8 +547,8 @@ def _runParsePipelineTask(ctx: PdfPipelineContext, apiKey: str, translateApiUrl:
     breakpoint = ctx.cache.findBreakpoint()
     log(f"共 {len(pageImages)} 页，从第 {breakpoint} 页开始解析", "INFO", ctx.verbose)
 
-    analyzer = _createImageAnalyzer(ctx.args, apiKey, ctx.verbose) if "image" in ctx.tasks else None
-    translator = _createTranslator(ctx, translateApiUrl, translateApiKey) if "translate" in ctx.tasks else None
+    analyzer = _createImageAnalyzer(ctx.config, ctx.args, apiKey, ctx.verbose) if "image" in ctx.tasks else None
+    translator = _createTranslator(ctx) if "translate" in ctx.tasks else None
 
     if "image" in ctx.tasks and analyzer is None:
         log("未配置 IMAGE_API_KEY，无法执行 image 任务", "WARN", True)
@@ -589,7 +596,7 @@ def _runParsePipelineTask(ctx: PdfPipelineContext, apiKey: str, translateApiUrl:
         _finalizeTranslationOutput(ctx)
 
 
-def _runCacheOnlyPostprocessors(ctx: PdfPipelineContext, apiKey: str, translateApiUrl: str, translateApiKey: str) -> None:
+def _runCacheOnlyPostprocessors(ctx: PdfPipelineContext, apiKey: str) -> None:
     _requireParsedCache(ctx, ",".join(ctx.tasks))
 
     imageError = None
@@ -605,7 +612,7 @@ def _runCacheOnlyPostprocessors(ctx: PdfPipelineContext, apiKey: str, translateA
     def run_translate():
         nonlocal translateError
         try:
-            _runTranslateTask(ctx, translateApiUrl, translateApiKey)
+            _runTranslateTask(ctx)
         except Exception as e:
             translateError = e
 
@@ -624,22 +631,19 @@ def _runCacheOnlyPostprocessors(ctx: PdfPipelineContext, apiKey: str, translateA
         raise translateError
 
 
-def _runPdfOrImage(
-    inputPath, outputDir, outputPath, cache, apiKey,
-    enableTranslation, translateApiUrl, translateApiKey, args, verbose,
-):
+def _runPdfOrImage(inputPath, outputDir, outputPath, cache, apiKey, config, args, verbose):
     tasks = args.pipeline_tasks
-    ctx = _setupPdfPipeline(inputPath, outputDir, outputPath, cache, tasks, args, verbose)
+    ctx = _setupPdfPipeline(inputPath, outputDir, outputPath, cache, tasks, config, args, verbose)
     try:
         if "parse" in tasks:
-            _runParsePipelineTask(ctx, apiKey, translateApiUrl, translateApiKey)
+            _runParsePipelineTask(ctx, apiKey)
         elif len(tasks) > 1:
-            _runCacheOnlyPostprocessors(ctx, apiKey, translateApiUrl, translateApiKey)
+            _runCacheOnlyPostprocessors(ctx, apiKey)
         else:
             if "image" in tasks:
                 _runImageTask(ctx, apiKey)
             if "translate" in tasks:
-                _runTranslateTask(ctx, translateApiUrl, translateApiKey)
+                _runTranslateTask(ctx)
     except KeyboardInterrupt:
         log("收到中断信号，已保留完成单元的缓存；下次运行将继续未完成任务", "WARN", True)
         raise
@@ -647,7 +651,7 @@ def _runPdfOrImage(
     _applyImageModeToFile(outputPath, outputDir, args.image_mode, verbose)
 
 
-def _runDocx(inputPath, outputDir, outputPath, outputFileName, cache, apiKey, args, verbose):
+def _runDocx(inputPath, outputDir, outputPath, outputFileName, cache, apiKey, config, args, verbose):
     """DOCX 简化缓存流程。"""
     docxData = cache._data.get("docx")
 
@@ -668,7 +672,7 @@ def _runDocx(inputPath, outputDir, outputPath, outputFileName, cache, apiKey, ar
                 "imageId": f"docx_img{i:02d}",
                 "relPath": os.path.relpath(absPath, outputDir) if absPath else "",
                 "absPath": absPath,
-                "status": "pending",
+                "analysisStatus": "pending",
                 "format": src.get("format", "png"),
             })
 
@@ -686,10 +690,10 @@ def _runDocx(inputPath, outputDir, outputPath, outputFileName, cache, apiKey, ar
 
     # 图像分析
     if apiKey and images:
-        analyzer = _createImageAnalyzer(args, apiKey, verbose)
+        analyzer = _createImageAnalyzer(config, args, apiKey, verbose)
 
         # 只分析 pending 状态的图片，使用并发批量分析
-        pendingImages = [img for img in images if img["status"] == "pending"]
+        pendingImages = [img for img in images if img.get("analysisStatus") == "pending"]
         log(f"待分析图片: {len(pendingImages)}/{len(images)}", "INFO", verbose)
 
         if pendingImages:
@@ -764,9 +768,6 @@ def buildArgParser() -> argparse.ArgumentParser:
   # 使用 image-mode=none（仅保留分析结果，不保留原图）
   python pipeline.py -i input.pdf --image-mode none --verbose
 
-  # 重新对已有输出执行图像理解（API 之前失败后重试）
-  python pipeline.py -i report.pdf --reanalyze-images --verbose
-
   # 强制从头开始（清理缓存）
   python pipeline.py -i input.pdf --clean-cache --verbose
         """
@@ -785,11 +786,7 @@ def buildArgParser() -> argparse.ArgumentParser:
     parser.add_argument("--tasks", type=str, default="",
                         help=("显式任务列表，逗号分隔：parse,image,translate。\n"
                               "示例: --tasks parse 或 --tasks image,translate。\n"
-                              "默认等价于 parse,image；提供后会覆盖旧的 skip/reanalyze/enable 参数。"))
-    parser.add_argument("--skip-image-analysis", action="store_true",
-                        help="跳过图像理解分析")
-    parser.add_argument("--reanalyze-images", action="store_true",
-                        help="重新对已有输出 MD 执行图像理解（跳过文件解析步骤）")
+                              "默认等价于 parse,image。"))
 
     # PDF 渲染参数
     parser.add_argument("--dpi", type=int, default=300,
@@ -806,8 +803,6 @@ def buildArgParser() -> argparse.ArgumentParser:
                         help="重试间隔秒数（默认: 15）")
 
     # 翻译功能
-    parser.add_argument("--enable-translation", action="store_true",
-                        help="开启翻译功能，生成 _cn.md 中文翻译文件")
     parser.add_argument("--max-concurrent-translate", type=int, default=5,
                         help="最大并发翻译请求数（默认: 2）")
     parser.add_argument("--translate-retry", type=int, default=10,
