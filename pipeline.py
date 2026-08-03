@@ -1,5 +1,12 @@
 '''
 Author: wilbur
+Version: 3.7
+  Date: 2026-08-03
+  Description: 新增 pdf 任务（--tasks pdf）：_runPdfTask 渲染译文 _cn.pdf；
+               _runPdfOrImage 三分支补 pdf 派发（image-mode 前）；VALID_PIPELINE_TASKS 加 pdf。
+               _runDocx 重构：早返回/解析分支/image跳过/translate(整体翻译+断点续传+长度预估+失败兜底)/pdf(只产_cn.pdf)。
+               新增 _createTranslatorForDocx。
+
 Version: 3.6
   Date: 2026-07-28
   Description: 修复 parse+translate 断点续跑时未重试缓存中 pending/failed 翻译页的问题
@@ -118,7 +125,7 @@ SUPPORTED_EXTENSIONS = {
     ".webp": "image",
 }
 
-VALID_PIPELINE_TASKS = ("parse", "image", "translate")
+VALID_PIPELINE_TASKS = ("parse", "image", "translate", "pdf")
 DEFAULT_PIPELINE_TASKS = ("parse", "image")
 
 
@@ -530,6 +537,27 @@ def _runTranslateTask(ctx: PdfPipelineContext) -> None:
     _finalizeTranslationOutput(ctx)
 
 
+def _runPdfTask(ctx: PdfPipelineContext) -> None:
+    """pdf 任务：把译文 md 渲染为 {stem}_cn.pdf。无译文则 WARN 跳过（不产原文 .pdf，原 PDF/DOCX 已是输入）。"""
+    from core.mdToPdf import markdownToPdf
+
+    _requireParsedCache(ctx, "pdf")
+    # 判定是否有译文（按页聚合，不用 cnOutputPath 判定--它仅在 translate in tasks 时非 None）
+    if not ctx.cache.hasTranslatedPages():
+        log("无已完成译文，pdf 任务跳过（需先运行 --tasks translate）", "WARN", ctx.verbose)
+        return
+
+    mdText = ctx.cache.rebuildTranslationMarkdown()
+    stem = Path(ctx.outputPath).stem
+    pdfPath = os.path.join(ctx.outputDir, f"{stem}_cn.pdf")
+    logSeparator("PDF 渲染（译文）", ctx.verbose)
+    ok = markdownToPdf(mdText, pdfPath, ctx.outputDir, ctx.verbose)
+    if ok:
+        log(f"译文 PDF 已生成: {pdfPath}", "DONE", ctx.verbose)
+    else:
+        log(f"译文 PDF 渲染失败: {pdfPath}", "ERROR", ctx.verbose)
+
+
 def buildImageInfo(pageNum: int, idx: int, absPath: str) -> dict:
     """构造单张图片的 info dict（解析缓存格式）。"""
     return {
@@ -662,6 +690,9 @@ def _runPdfOrImage(inputPath, outputDir, outputPath, cache, apiKey, config, args
                 _runImageTask(ctx, apiKey)
             if "translate" in tasks:
                 _runTranslateTask(ctx)
+        # pdf 任务在 image-mode 后处理之前渲染（保证 _cn.pdf 含图，.md 可独立走 image-mode=none）
+        if "pdf" in tasks:
+            _runPdfTask(ctx)
     except KeyboardInterrupt:
         log("收到中断信号，已保留完成单元的缓存；下次运行将继续未完成任务", "WARN", True)
         raise
@@ -670,18 +701,21 @@ def _runPdfOrImage(inputPath, outputDir, outputPath, cache, apiKey, config, args
 
 
 def _runDocx(inputPath, outputDir, outputPath, outputFileName, cache, apiKey, config, args, verbose):
-    """DOCX 简化缓存流程。"""
-    docxData = cache._data.get("docx")
+    """DOCX 缓存流程：解析->image->translate->pdf（按 tasks 执行，缓存命中不重解析/重跑）。"""
+    from core.mdToPdf import markdownToPdf
 
-    if docxData and docxData.get("status") == "completed":
+    docxData = cache._data.get("docx")
+    tasks = args.pipeline_tasks
+
+    # 早返回：已完成且本次无 pdf/translate 需求
+    if docxData and docxData.get("status") == "completed" \
+            and "pdf" not in tasks and "translate" not in tasks:
         log("DOCX 已完成（缓存），跳过", "INFO", verbose)
         return
 
-    # 解析 DOCX
-    if docxData is None or docxData.get("status") not in ("parsed", "analyzing"):
+    # 解析分支：仅无缓存时解析（v1.3 高1：completed 不被重新解析覆盖）
+    if docxData is None:
         markdown = parseDocx(inputPath, outputDir, outputFileName, verbose)
-
-        # 提取图片信息
         imageSources = extractImageSources(markdown, outputDir, verbose)
         images = []
         for i, (_, src) in enumerate(imageSources):
@@ -693,27 +727,21 @@ def _runDocx(inputPath, outputDir, outputPath, outputFileName, cache, apiKey, co
                 "analysisStatus": "pending",
                 "format": src.get("format", "png"),
             })
-
         cache.setDocxRaw(markdown, images)
-
-        # 先写出原始 markdown
         with open(outputPath, "w", encoding="utf-8") as f:
             f.write(markdown)
         log("DOCX 原始 Markdown 已写出", "INFO", verbose)
     else:
-        # 从缓存恢复
         markdown = docxData["rawMarkdown"]
         images = docxData.get("images", [])
-        log(f"从缓存恢复 DOCX，跳过解析，{len(images)} 张图片待处理", "INFO", verbose)
+        log(f"从缓存恢复 DOCX（status={docxData.get('status')}），跳过解析", "INFO", verbose)
 
-    # 图像分析
-    if apiKey and images:
+    # image 分析：completed 且 image not in tasks 时跳过（v1.4 中新3，避免 translate 副作用重跑 image）
+    needImage = "image" in tasks or docxData is None or docxData.get("status") != "completed"
+    if apiKey and images and needImage:
         analyzer = _createImageAnalyzer(config, args, apiKey, verbose)
-
-        # 只分析 pending 状态的图片，使用并发批量分析
         pendingImages = [img for img in images if img.get("analysisStatus") == "pending"]
         log(f"待分析图片: {len(pendingImages)}/{len(images)}", "INFO", verbose)
-
         if pendingImages:
             sources = [{"path": img["absPath"], "format": img.get("format", "png")}
                        for img in pendingImages]
@@ -722,18 +750,75 @@ def _runDocx(inputPath, outputDir, outputPath, outputFileName, cache, apiKey, co
                 cache.updateDocxImageResult(imgInfo["imageId"], result)
                 if result:
                     log(f"图片 {imgInfo['imageId']} 分析成功", "DEBUG", verbose)
-
-        # 生成 finalMarkdown
         finalMd = buildFinalMarkdownFromCache(cache._data["docx"], outputDir, verbose)
         cache.setDocxFinal(finalMd)
-
-        # 覆写 .md
         with open(outputPath, "w", encoding="utf-8") as f:
             f.write(finalMd)
         log("DOCX 最终 Markdown 已写出", "INFO", verbose)
 
-    # image-mode 后处理
+    # translate：DOCX 单文档整体翻译（v1.2 新增；v1.3 中1 失败兜底 + 中5 长度预估；断点续传）
+    cnOutputPath = os.path.join(outputDir, f"{Path(outputPath).stem}_cn.md")
+    if "translate" in tasks:
+        translator = _createTranslatorForDocx(config, args, verbose)
+        if translator is None:
+            log("未配置 TRANSLATE_API_URL 或 TRANSLATE_API_KEY，跳过 DOCX 翻译", "WARN", True)
+        else:
+            pending = list(cache.iterDocxPendingTranslation())
+            if pending:
+                rawMd = cache._data["docx"]["rawMarkdown"]
+                estTokens = len(rawMd)  # 中文 1 字符≈1-2 tokens
+                log(f"DOCX 待翻译，长度 {len(rawMd)} 字符（粗估 {estTokens} tokens）", "INFO", verbose)
+                if estTokens > 16000:
+                    log("文档过长，整体翻译可能失败，建议拆分", "ERROR", True)
+                result = translator.translate(rawMd)
+                cache.setDocxTranslation(result)
+                if result:
+                    with open(cnOutputPath, "w", encoding="utf-8") as f:
+                        f.write(result)
+                    log(f"DOCX 译文已写出: {cnOutputPath}", "DONE", verbose)
+                else:
+                    log("DOCX 翻译失败，未写 _cn.md（重跑可重试）", "ERROR", True)
+            else:
+                # 断点续传：复用缓存译文重写 _cn.md
+                cached = cache._data["docx"].get("translatedContent")
+                if cached:
+                    with open(cnOutputPath, "w", encoding="utf-8") as f:
+                        f.write(cached)
+                    log(f"DOCX 译文从缓存恢复: {cnOutputPath}", "INFO", verbose)
+
+    # pdf：DOCX 只产 _cn.pdf（v1.5；在 image-mode 前渲染，保证含图）
+    if "pdf" in tasks:
+        docx = cache._data.get("docx") or {}
+        if docx.get("translationStatus") == "completed" and docx.get("translatedContent"):
+            mdText = docx["translatedContent"]
+            pdfPath = os.path.join(outputDir, f"{Path(outputPath).stem}_cn.pdf")
+            logSeparator("PDF 渲染（DOCX 译文）", verbose)
+            ok = markdownToPdf(mdText, pdfPath, outputDir, verbose)
+            if ok:
+                log(f"DOCX 译文 PDF 已生成: {pdfPath}", "DONE", verbose)
+            else:
+                log(f"DOCX 译文 PDF 渲染失败: {pdfPath}", "ERROR", verbose)
+        else:
+            log("DOCX 无已完成译文，pdf 任务跳过", "WARN", verbose)
+
+    # image-mode 后处理（pdf 渲染之后）
     _applyImageModeToFile(outputPath, outputDir, args.image_mode, verbose)
+
+
+def _createTranslatorForDocx(config, args, verbose):
+    """DOCX 翻译用的 Translator（与 PDF 分支 _createTranslator 复用配置，但无 ctx 依赖）。"""
+    if not config.translateApiKey or not config.translateApiUrl:
+        return None
+    from core.translator import Translator
+    return Translator(
+        apiUrl=config.translateApiUrl,
+        apiKey=config.translateApiKey,
+        model=config.translateApiModel,
+        maxConcurrent=args.max_concurrent_translate,
+        maxRetry=args.translate_retry,
+        retryDelay=args.translate_retry_delay,
+        verbose=verbose,
+    )
 
 
 def _applyImageModeToFile(outputPath, outputDir, imageMode, verbose):

@@ -11,3 +11,5 @@ test/
 .worktrees/
 .DS_Store
 .pi-subagents/
+logs/
+scripts/demo_out/

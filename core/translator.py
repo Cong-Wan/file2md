@@ -1,5 +1,10 @@
 '''
 Author: wilbur
+Version: 1.8
+  Date: 2026-08-03
+  Description: TRANSLATION_SYSTEM_PROMPT 新增第7条：硬约束图片引用 ![](path) 原样保留
+               （alt 可译、路径不变、不去感叹号），保障 pdf 任务渲染 _cn.pdf 图片不丢失
+
 Version: 1.7
   Date: 2026-07-28
   Description: 迁移至 core 包，日志改为 core.logUtils 统一实现并补 [Translator] tag
@@ -41,7 +46,8 @@ TRANSLATION_SYSTEM_PROMPT = (
     "3. 数学公式、代码块保持原样，只翻译注释和说明文字\n"
     "4. 图表标题和说明文字需要翻译\n"
     "5. 保持原文的层次结构（标题、列表、引用等）\n"
-    "6. 翻译流畅，符合中文表达习惯"
+    "6. 翻译流畅，符合中文表达习惯\n"
+    "7. 图片引用 ![](路径) 必须原样保留，不得删除、改写路径或去掉感叹号；alt 文本可翻译但路径不变"
 )
 
 

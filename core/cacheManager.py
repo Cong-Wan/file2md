@@ -1,5 +1,10 @@
 '''
 Author: wilbur
+Version: 1.6
+  Date: 2026-08-03
+  Description: DOCX 翻译支持：setDocxRaw 加翻译字段、新增 setDocxTranslation(失败兜底+锁)/
+               iterDocxPendingTranslation(守卫)、resetRunningStates 加 docx 分支、新增 hasTranslatedPages
+
 Version: 1.5
   Date: 2026-07-28
   Description: 重构 Step4：删除 _normalizeImage/_normalizePage/_migrateCacheData 迁移逻辑；
@@ -228,6 +233,11 @@ class CacheManager:
                     if img.get("analysisStatus") == "running":
                         img["analysisStatus"] = "pending"
                         changed = True
+            # DOCX 翻译态（v1.2 当前同步不 markRunning，但为分块翻译铺路）
+            docx = self._data.get("docx")
+            if docx and docx.get("translationStatus") == "running":
+                docx["translationStatus"] = "pending"
+                changed = True
             if changed:
                 self.save()
 
@@ -248,6 +258,10 @@ class CacheManager:
 
     def hasParsedPages(self) -> bool:
         return any(p.get("parseStatus") == "completed" for p in self._data.get("pages", []))
+
+    def hasTranslatedPages(self) -> bool:
+        """是否存在任意已完成翻译的页（pdf 任务判定是否渲染 _cn.pdf 用，按页聚合）。"""
+        return any(p.get("translationStatus") == "completed" for p in self._data.get("pages", []))
 
     def markTranslationRunning(self, pageNum: int) -> None:
         with self._lock:
@@ -279,6 +293,9 @@ class CacheManager:
                 "rawMarkdown": rawMarkdown,
                 "images": images,
                 "finalMarkdown": None,
+                "translatedContent": None,
+                "translationStatus": "pending",
+                "translatedAt": None,
             }
             self.save()
 
@@ -304,6 +321,28 @@ class CacheManager:
             docx["status"] = "completed"
             docx["finalMarkdown"] = finalMarkdown
             self.save()
+
+    def setDocxTranslation(self, content: str | None) -> None:
+        """写 DOCX 译文。content 为 None/空串时状态置 failed（与 PDF updateTranslationResult 对称，空串视同 None）。"""
+        with self._lock:
+            docx = self._data.get("docx")
+            if docx is None:
+                return
+            ok = bool(content and content.strip())
+            docx["translatedContent"] = content if ok else None
+            docx["translatedAt"] = datetime.now().isoformat() if ok else None
+            docx["translationStatus"] = "completed" if ok else "failed"
+            self.save()
+
+    def iterDocxPendingTranslation(self):
+        """yield 待翻译的 docx（单文档只 yield 一次）。含前置守卫。"""
+        docx = self._data.get("docx")
+        if not docx or not docx.get("rawMarkdown"):
+            return
+        if docx.get("status") not in ("parsed", "analyzing", "completed"):
+            return
+        if docx.get("translationStatus", "pending") in ("pending", "failed"):
+            yield docx
 
     # ============================================================
     # 重建
